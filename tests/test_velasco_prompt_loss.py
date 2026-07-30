@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from desc.compute._fast_ion import _alpha_loss_cone
+from desc.compute._fast_ion import (
+    _alpha_loss_cone,
+    _superbanana_exists,
+    _velasco_data,
+    _velasco_model,
+)
 from desc.examples import get
 from desc.grid import LinearGrid
 from desc.integrals.bounce_integral import Bounce2D
@@ -142,3 +147,50 @@ def test_velasco_models_normalization(main_well):
     assert (g_a >= 0).all()
     assert (g_a <= g_d + 1e-12).all()
     assert (g_d <= bound + 1e-12).all()
+
+
+def test_pitch_density_integrates_to_model():
+    """Stopping before the pitch quadrature must not change the answer.
+
+    ``per_pitch`` returns dGamma/dlambda on the quadrature nodes rather than
+    the surface integral, so contracting it with the node widths has to
+    reproduce the registered compute function exactly.
+
+    The inputs must be requested with the override grid off. The grid
+    requirements of the registered functions suppress it for them, so leaving
+    it on here would hand the model slightly different drifts and the two would
+    disagree by a fraction of a percent for a reason that has nothing to do
+    with the pitch quadrature.
+    """
+    eq = get("W7-X")
+    rho = np.array([0.5, 0.9])
+    grid = LinearGrid(rho=rho, M=eq.M_grid, N=eq.N_grid, NFP=eq.NFP, sym=False)
+    kwargs = dict(
+        angle=Bounce2D.angle(eq, X=32, Y=32, rho=rho, tol=1e-10),
+        alpha=np.linspace(0, 2 * np.pi, 16, endpoint=False),
+        num_transit=1,
+        num_well=20,
+        num_pitch=24,
+        num_quad=32,
+        Y_B=grid.num_zeta * grid.NFP,
+        nufft_eps=1e-10,
+        gamma_th=GAMMA_TH,
+    )
+    data = eq.compute(_velasco_data, grid=grid, override_grid=False)
+    pitch_inv, weight = Bounce2D.get_pitch_inv_quad(
+        grid.compress(data["min_tz |B|"]),
+        grid.compress(data["max_tz |B|"]),
+        kwargs["num_pitch"],
+        simp=True,
+    )
+    for name, classifier in (
+        ("Gamma_alpha", _alpha_loss_cone),
+        ("Gamma_delta", lambda g, d, th: _superbanana_exists(g, th)),
+    ):
+        density = _velasco_model(classifier, data, grid, kwargs, per_pitch=True)
+        np.testing.assert_allclose(
+            np.sum(density * weight / pitch_inv**2, axis=-1),
+            grid.compress(eq.compute(name, grid, **kwargs)[name]),
+            rtol=1e-12,
+            err_msg=name,
+        )

@@ -606,7 +606,7 @@ def _alpha_loss_cone(gamma_c_star, poloidal_drift, gamma_th):
     return jnp.moveaxis(lost, -1, -3)
 
 
-def _velasco_model(classifier, data, grid, kwargs):
+def _velasco_model(classifier, data, grid, kwargs, per_pitch=False):
     """Phase space average of a 0/1 orbit classifier, normalized as Velasco.
 
     Returns ½ 〈∫dλ B (1−λB)^(−1/2) C 〉 where C is the classifier, so that the
@@ -614,6 +614,18 @@ def _velasco_model(classifier, data, grid, kwargs):
     the upper bound is instead the trapped fraction held by the deepest well of
     each field line, which is obtained by evaluating ``Gamma_delta`` with
     ``gamma_th=-inf``.
+
+    Parameters
+    ----------
+    per_pitch : bool
+        If ``True``, stop before the quadrature over λ and return the density
+        dΓ/dλ with shape (num rho, num pitch) on the nodes given by
+        ``Bounce2D.get_pitch_inv_quad``, rather than the surface quantity Γ
+        expanded onto ``grid``. Contracting the density with the λ weights
+        ``pitch_inv weight / pitch_inv²`` recovers Γ exactly, since that
+        contraction is the only step this skips. Intended for diagnostics that
+        resolve which pitch angles a model declares lost.
+
     """
     (
         angle,
@@ -654,32 +666,29 @@ def _velasco_model(classifier, data, grid, kwargs):
             unconfined = classifier(gamma_c_star, poloidal_drift, gamma_th)
             return (v_tau * unconfined).sum(-1).mean(-2)
 
+        density = batch_map(fun, data["pitch_inv"], pitch_batch_size)
+        if per_pitch:
+            return density
         return jnp.sum(
-            batch_map(fun, data["pitch_inv"], pitch_batch_size)
-            * data["pitch_inv weight"]
-            / data["pitch_inv"] ** 2,
-            axis=-1,
+            density * data["pitch_inv weight"] / data["pitch_inv"] ** 2, axis=-1
         )
 
-    return (
-        Bounce2D.batch(
-            Gamma,
-            {
-                "cvdrift0": data["cvdrift0"],
-                "gbdrift (periodic)": data["gbdrift (periodic)"],
-                "gbdrift (secular)/phi": data["gbdrift (secular)/phi"],
-            },
-            data,
-            angle,
-            grid,
-            num_pitch,
-            surf_batch_size,
-            expand_out=True,
-        )
-        * _VELASCO_NORM
-        / data["V_psi"]
-        / (num_transit * 2**0.5)
+    out = Bounce2D.batch(
+        Gamma,
+        {
+            "cvdrift0": data["cvdrift0"],
+            "gbdrift (periodic)": data["gbdrift (periodic)"],
+            "gbdrift (secular)/phi": data["gbdrift (secular)/phi"],
+        },
+        data,
+        angle,
+        grid,
+        num_pitch,
+        surf_batch_size,
+        expand_out=not per_pitch,
     )
+    V_psi = grid.compress(data["V_psi"])[:, jnp.newaxis] if per_pitch else data["V_psi"]
+    return out * _VELASCO_NORM / V_psi / (num_transit * 2**0.5)
 
 
 _velasco_data = [
