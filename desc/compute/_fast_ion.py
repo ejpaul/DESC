@@ -6,6 +6,7 @@ from desc.backend import jit, jnp
 
 from ..batching import batch_map
 from ..integrals.bounce_integral import Bounce2D
+from ..integrals.surface_integral import surface_averages
 from ..utils import cross, dot, safediv
 from ._neoclassical import _bounce_doc, _bounce_static_argnames
 from .data_index import register_compute_fun
@@ -451,5 +452,362 @@ def _Gamma_c_Velasco(params, transforms, profiles, data, **kwargs):
         )
         / data["V_psi"]
         / (num_transit * 2**0.5)
+    )
+    return data
+
+
+################################################################################
+# Velasco et al. prompt loss models.
+# J.L. Velasco et al 2021 Nucl. Fusion 61 116059.
+# https://doi.org/10.1088/1741-4326/ac2994
+################################################################################
+
+# Γ_c weights (γ_c π/2)² by v τ and divides by V_psi √2 num_transit to obtain
+# equation 16, which equals π/(4√2) 〈∫dλ B (1−λB)^(−1/2) (γ_c^*)²〉. Replacing
+# the weight by a classifier C therefore requires the factor below to obtain
+# Velasco's normalization ½ 〈∫dλ B (1−λB)^(−1/2) C〉, for which C ≡ 1 recovers
+# f_trapped (equation 24). Setting ``gamma_th=-inf`` in ``Gamma_delta`` makes
+# C ≡ 1 and is the recommended check of this normalization.
+_VELASCO_NORM = jnp.pi / 2**0.5
+
+_gamma_th_doc = """float :
+    Threshold γ_th on γ_c^* above which a superbanana is declared.
+    Velasco et al. use ``0.2``, which corresponds to a bounce averaged
+    trajectory that traverses a distance 1 in s while precessing π in α.
+    Varying the equivalent drift ratio between π/2 and 2π does not
+    significantly change the predicted loss fractions. Default is ``0.2``.
+    """
+_velasco_doc = {**_bounce_doc, "gamma_th": _gamma_th_doc}
+_velasco_static_argnames = _bounce_static_argnames + ("gamma_th",)
+
+
+def _gamma_c_star(radial_drift, poloidal_drift):
+    """Velasco et al. equation 14.
+
+    γ_c^* = 2/π arctan( 〈𝐯_M⋅∇s〉 / |〈𝐯_M⋅∇α〉| ).
+
+    This differs from Nemov's γ_c (equation 15) only in that the denominator is
+    unsigned, so that (γ_c^*)² = γ_c² while the sign of γ_c^* is the sign of the
+    bounce averaged radial drift. That sign is what distinguishes the inward
+    (α_in, γ_c^* < −γ_th) from the outward (α_out, γ_c^* > γ_th) edge of a
+    superbanana, and hence is what the models of Velasco et al. sections 4.1 and
+    4.2 classify on.
+    """
+    return (2 / jnp.pi) * jnp.arctan(safediv(radial_drift, jnp.abs(poloidal_drift)))
+
+
+def _velasco_drifts(bounce, data, pitch_inv, num_well, nufft_eps):
+    """Return v τ, γ_c^*, and the bounce averaged tangential drift."""
+    v_tau, radial_drift, poloidal_drift = bounce.integrate(
+        [_v_tau, _radial_drift, _poloidal_drift],
+        pitch_inv,
+        data,
+        ["cvdrift0", "gbdrift (periodic)", "gbdrift (secular)/phi"],
+        num_well=num_well,
+        nufft_eps=nufft_eps,
+        is_fourier=True,
+    )
+    return v_tau, _gamma_c_star(radial_drift, poloidal_drift), poloidal_drift
+
+
+def _superbanana_exists(gamma_c_star, gamma_th):
+    """Heaviside of Velasco et al. equation 22.
+
+    ``H(max(γ_c^*(α|λ)) − γ_th)`` where the maximum is taken over the field line
+    label α and over the wells of each field line. The result depends only on
+    (ρ, λ), so it is returned with the α and well axes kept as singletons.
+    """
+    return jnp.max(gamma_c_star, axis=(-3, -1), keepdims=True) > gamma_th
+
+
+def _alpha_loss_cone(gamma_c_star, poloidal_drift, gamma_th):
+    """Product of Heavisides in Velasco et al. equation 25.
+
+    A trapped particle precesses monotonically in α in the direction of
+    〈𝐯_M⋅∇α〉 at fixed λ. It is lost when it reaches an outward superbanana at
+    α_out (γ_c^* > γ_th) and is retained when it first reaches an inward one at
+    α_in (γ_c^* < −γ_th), so the loss cone is the set of α that meet α_out
+    before α_in when marching along the precession direction. Marching over the
+    whole periodic α grid generalizes equation 25 to any number of superbanana
+    pairs and handles the periodicity of α automatically.
+
+    Parameters
+    ----------
+    gamma_c_star, poloidal_drift : jnp.ndarray
+        Shape (num rho, num alpha, num pitch, num well). The α axis must be a
+        sorted grid that covers [0, 2π) so that neighboring indices are
+        neighboring field lines.
+
+    Returns
+    -------
+    jnp.ndarray
+        Boolean array shaped like ``gamma_c_star``.
+
+    """
+    num_alpha = gamma_c_star.shape[-3]
+    # Move α last so the march is a gather along the final axis.
+    outward = jnp.moveaxis(gamma_c_star > gamma_th, -3, -1)
+    marked = jnp.moveaxis(jnp.abs(gamma_c_star) > gamma_th, -3, -1)
+    # Particles with no tangential precession never leave α; treating them as
+    # co-precessing only affects a measure zero set of the α grid.
+    step = jnp.where(jnp.moveaxis(poloidal_drift, -3, -1) < 0, -1, 1)
+
+    index = jnp.arange(num_alpha)
+    # visit[..., i, k] is the α index reached after k precession steps from i.
+    visit = (index[:, None] + step[..., None] * index) % num_alpha
+    shape = visit.shape
+    hit = jnp.take_along_axis(
+        jnp.broadcast_to(marked[..., None, :], shape), visit, axis=-1
+    )
+    exits = jnp.take_along_axis(
+        jnp.broadcast_to(outward[..., None, :], shape), visit, axis=-1
+    )
+    # argmax returns the first ``True``; guard the case of no superbanana at all,
+    # for which argmax would spuriously select the starting point.
+    first = jnp.argmax(hit, axis=-1)[..., None]
+    lost = jnp.take_along_axis(exits, first, axis=-1)[..., 0] & jnp.any(
+        hit, axis=(-2, -1), keepdims=True
+    )[..., 0]
+    return jnp.moveaxis(lost, -1, -3)
+
+
+def _velasco_model(classifier, data, grid, kwargs):
+    """Phase space average of a 0/1 orbit classifier, normalized as Velasco.
+
+    Returns ½ 〈∫dλ B (1−λB)^(−1/2) C 〉 where C is the classifier, so that the
+    result lies between 0 and ``f_trapped (Velasco)``.
+    """
+    (
+        angle,
+        Y_B,
+        alpha,
+        num_transit,
+        num_well,
+        num_pitch,
+        pitch_batch_size,
+        surf_batch_size,
+        nufft_eps,
+        spline,
+        quad,
+        vander,
+    ) = Bounce2D._defaults(-1, grid, **kwargs)
+    gamma_th = kwargs.get("gamma_th", 0.2)
+
+    def Gamma(data):
+        bounce = Bounce2D(
+            grid,
+            data,
+            data["angle"],
+            Y_B,
+            alpha,
+            num_transit,
+            quad,
+            nufft_eps=nufft_eps,
+            is_fourier=True,
+            spline=spline,
+            vander=vander,
+        )
+
+        def fun(pitch_inv):
+            v_tau, gamma_c_star, poloidal_drift = _velasco_drifts(
+                bounce, data, pitch_inv, num_well, nufft_eps
+            )
+            unconfined = classifier(gamma_c_star, poloidal_drift, gamma_th)
+            return (v_tau * unconfined).sum(-1).mean(-2)
+
+        return jnp.sum(
+            batch_map(fun, data["pitch_inv"], pitch_batch_size)
+            * data["pitch_inv weight"]
+            / data["pitch_inv"] ** 2,
+            axis=-1,
+        )
+
+    return (
+        Bounce2D.batch(
+            Gamma,
+            {
+                "cvdrift0": data["cvdrift0"],
+                "gbdrift (periodic)": data["gbdrift (periodic)"],
+                "gbdrift (secular)/phi": data["gbdrift (secular)/phi"],
+            },
+            data,
+            angle,
+            grid,
+            num_pitch,
+            surf_batch_size,
+            expand_out=True,
+        )
+        * _VELASCO_NORM
+        / data["V_psi"]
+        / (num_transit * 2**0.5)
+    )
+
+
+_velasco_data = [
+    "min_tz |B|",
+    "max_tz |B|",
+    "cvdrift0",
+    "gbdrift (periodic)",
+    "gbdrift (secular)/phi",
+    "V_psi",
+] + Bounce2D.required_names
+
+
+@register_compute_fun(
+    name="f_trapped (Velasco)",
+    label="f_{\\mathrm{trapped}} = \\langle \\sqrt{1 - B / B_{\\max}} \\rangle",
+    units="~",
+    units_long="None",
+    description="Fraction of trapped particles bounding Gamma_alpha and "
+    "Gamma_delta, as defined by Velasco et al. "
+    "(doi:10.1088/1741-4326/ac2994)",
+    dim=1,
+    params=[],
+    transforms={"grid": []},
+    profiles=[],
+    coordinates="r",
+    data=["|B|", "max_tz |B|", "sqrt(g)"],
+    resolution_requirement="tz",
+)
+def _f_trapped_Velasco(params, transforms, profiles, data, **kwargs):
+    """Fraction of trapped particles, Velasco et al. equation 24.
+
+    This is the closed form of ½ 〈∫ dλ B (1−λB)^(−1/2)〉 over the trapped
+    domain λ ∈ [B_max⁻¹, B⁻¹]. It is the upper bound of both ``Gamma_delta``
+    and ``Gamma_alpha``, which classify a subset of the trapped particles as
+    promptly lost.
+
+    Note this is a different quantity from ``trapped fraction``, the effective
+    trapped particle fraction of neoclassical bootstrap theory.
+    """
+    data["f_trapped (Velasco)"] = surface_averages(
+        transforms["grid"],
+        jnp.sqrt(jnp.abs(1 - data["|B|"] / data["max_tz |B|"])),
+        sqrt_g=data["sqrt(g)"],
+    )
+    return data
+
+
+@register_compute_fun(
+    name="Gamma_delta",
+    label=(
+        # Γ_δ = ½ 〈∫ dλ B (1−λB)^(−1/2) H(max(γ_c^*(α|λ)) − γ_th) 〉
+        "\\Gamma_{\\delta} = \\frac{1}{2} \\left\\langle \\int d\\lambda "
+        "\\frac{B}{\\sqrt{1 - \\lambda B}} H\\left("
+        "\\max(\\gamma_c^*(\\alpha \\vert \\lambda)) - \\gamma_{\\mathrm{th}}"
+        "\\right) \\right\\rangle"
+    ),
+    units="~",
+    units_long="None",
+    description="Prompt loss fraction of energetic ions from superbanana "
+    "existence (Velasco et al. model I, doi:10.1088/1741-4326/ac2994)",
+    dim=1,
+    params=[],
+    transforms={"grid": []},
+    profiles=[],
+    coordinates="r",
+    data=_velasco_data,
+    resolution_requirement="tz",
+    grid_requirement={"can_fft2": True},
+    **_velasco_doc,
+)
+@partial(jit, static_argnames=_velasco_static_argnames)
+def _Gamma_delta(params, transforms, profiles, data, **kwargs):
+    """Prompt loss model I of Velasco et al., equation 22.
+
+    Notes
+    -----
+    [1] A model for the fast evaluation of prompt losses of energetic ions in
+        stellarators. Equation 22.
+        J.L. Velasco et al. 2021 Nucl. Fusion 61 116059.
+        https://doi.org/10.1088/1741-4326/ac2994.
+
+    Every particle whose pitch angle admits a superbanana somewhere on the flux
+    surface is counted as lost. Unlike ``Gamma_c``, which is a proxy for how far
+    the contours of J deviate from the flux surface, this is a classification of
+    orbits into confined and unconfined and is therefore a direct estimate of
+    the loss fraction, bounded above by ``f_trapped (Velasco)``.
+
+    Ignoring where on the surface the superbanana sits makes this model
+    pessimistic; ``Gamma_alpha`` refines it with the α loss cone and is the
+    better predictor. Reference [1] section 5.4 reports that Γ_δ generally
+    overestimates the losses found by full orbit simulations.
+
+    Warnings
+    --------
+    The Heaviside classification is not differentiable, so this is a diagnostic
+    rather than an optimization objective.
+
+    """
+    data["Gamma_delta"] = _velasco_model(
+        lambda g, d, th: _superbanana_exists(g, th), data, transforms["grid"], kwargs
+    )
+    return data
+
+
+@register_compute_fun(
+    name="Gamma_alpha",
+    label=(
+        # Γ_α = ½ 〈∫ dλ B (1−λB)^(−1/2) H((α_out−α)〈v_M⋅∇α〉) H((α−α_in)〈v_M⋅∇α〉) 〉
+        "\\Gamma_{\\alpha} = \\frac{1}{2} \\left\\langle \\int d\\lambda "
+        "\\frac{B}{\\sqrt{1 - \\lambda B}} "
+        "H\\left((\\alpha_{\\mathrm{out}} - \\alpha) "
+        "\\overline{\\mathbf{v}_M \\cdot \\nabla \\alpha}\\right) "
+        "H\\left((\\alpha - \\alpha_{\\mathrm{in}}) "
+        "\\overline{\\mathbf{v}_M \\cdot \\nabla \\alpha}\\right) "
+        "\\right\\rangle"
+    ),
+    units="~",
+    units_long="None",
+    description="Prompt loss fraction of energetic ions from the alpha loss "
+    "cone (Velasco et al. model II, doi:10.1088/1741-4326/ac2994)",
+    dim=1,
+    params=[],
+    transforms={"grid": []},
+    profiles=[],
+    coordinates="r",
+    data=_velasco_data,
+    resolution_requirement="tz",
+    grid_requirement={"can_fft2": True},
+    **_velasco_doc,
+)
+@partial(jit, static_argnames=_velasco_static_argnames)
+def _Gamma_alpha(params, transforms, profiles, data, **kwargs):
+    """Prompt loss model II of Velasco et al., equation 25.
+
+    Notes
+    -----
+    [1] A model for the fast evaluation of prompt losses of energetic ions in
+        stellarators. Equation 25.
+        J.L. Velasco et al. 2021 Nucl. Fusion 61 116059.
+        https://doi.org/10.1088/1741-4326/ac2994.
+
+    Refines ``Gamma_delta`` by asking not only whether a superbanana exists at a
+    given pitch angle but whether the particle precesses into it. Only the
+    trapped particles born between an inward superbanana at α_in and the next
+    outward one at α_out, in the direction of their tangential magnetic drift,
+    escape; the rest stay on closed contours of J. Reference [1] validates
+    Γ_α against ASCOT as a quantitative prediction of the prompt loss fraction,
+    f_pl = Γ_α (equation 27).
+
+    Because the α loss cone is resolved on the grid of field line labels, the
+    keyword ``alpha`` must be a sorted grid covering [0, 2π), e.g.
+    ``np.linspace(0, 2 * np.pi, 64, endpoint=False)``, rather than the single
+    field line that is the default of the other bounce averaged metrics. With
+    an explicit α grid, use ``num_transit=1`` so the surface is covered once.
+
+    Warnings
+    --------
+    The Heaviside classification is not differentiable, so this is a diagnostic
+    rather than an optimization objective.
+
+    Particles are assumed to remain in the same well index while precessing in
+    α. This is exact in the single well per field line limit that reference [1]
+    assumes, and degrades where ripple wells appear and disappear across
+    neighboring field lines.
+
+    """
+    data["Gamma_alpha"] = _velasco_model(
+        _alpha_loss_cone, data, transforms["grid"], kwargs
     )
     return data
