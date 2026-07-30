@@ -477,8 +477,22 @@ _gamma_th_doc = """float :
     Varying the equivalent drift ratio between π/2 and 2π does not
     significantly change the predicted loss fractions. Default is ``0.2``.
     """
-_velasco_doc = {**_bounce_doc, "gamma_th": _gamma_th_doc}
-_velasco_static_argnames = _bounce_static_argnames + ("gamma_th",)
+_main_well_doc = """bool :
+    Whether to keep only the deepest well of each field line, the one holding
+    the smallest |B|. Velasco et al. discard ripple wells on the grounds that
+    their limited angular extent lets a particle precess out of the well before
+    it drifts appreciably in radius, so that they drive stochastic rather than
+    prompt losses. Setting this to ``True`` reproduces that assumption and makes
+    γ_c^* a function of α and λ alone. Setting it to ``False`` sums over every
+    well, which is the convention of ``Gamma_c`` and makes the models bounded by
+    the full ``f_trapped (Velasco)``. Default is ``False``.
+    """
+_velasco_doc = {
+    **_bounce_doc,
+    "gamma_th": _gamma_th_doc,
+    "main_well": _main_well_doc,
+}
+_velasco_static_argnames = _bounce_static_argnames + ("gamma_th", "main_well")
 
 
 def _gamma_c_star(radial_drift, poloidal_drift):
@@ -496,17 +510,38 @@ def _gamma_c_star(radial_drift, poloidal_drift):
     return (2 / jnp.pi) * jnp.arctan(safediv(radial_drift, jnp.abs(poloidal_drift)))
 
 
-def _velasco_drifts(bounce, data, pitch_inv, num_well, nufft_eps):
+def _velasco_drifts(bounce, data, pitch_inv, num_well, nufft_eps, main_well):
     """Return v τ, γ_c^*, and the bounce averaged tangential drift."""
+    points = bounce.points(pitch_inv, num_well)
     v_tau, radial_drift, poloidal_drift = bounce.integrate(
         [_v_tau, _radial_drift, _poloidal_drift],
         pitch_inv,
         data,
         ["cvdrift0", "gbdrift (periodic)", "gbdrift (secular)/phi"],
-        num_well=num_well,
+        points=points,
         nufft_eps=nufft_eps,
         is_fourier=True,
     )
+    if main_well:
+        z1, z2 = points
+        exists = z1 < z2
+        # Wells that were not detected are padded with z1 = z2 = 0; sending
+        # their depth to infinity keeps argmin from selecting them.
+        deepest = jnp.argmin(
+            jnp.where(
+                exists,
+                bounce.interp_to_argmin(
+                    data["|B|"], points, nufft_eps=nufft_eps, is_fourier=True
+                ),
+                jnp.inf,
+            ),
+            axis=-1,
+        )[..., None]
+        v_tau = jnp.take_along_axis(v_tau, deepest, axis=-1) * jnp.take_along_axis(
+            exists, deepest, axis=-1
+        )
+        radial_drift = jnp.take_along_axis(radial_drift, deepest, axis=-1)
+        poloidal_drift = jnp.take_along_axis(poloidal_drift, deepest, axis=-1)
     return v_tau, _gamma_c_star(radial_drift, poloidal_drift), poloidal_drift
 
 
@@ -575,7 +610,10 @@ def _velasco_model(classifier, data, grid, kwargs):
     """Phase space average of a 0/1 orbit classifier, normalized as Velasco.
 
     Returns ½ 〈∫dλ B (1−λB)^(−1/2) C 〉 where C is the classifier, so that the
-    result lies between 0 and ``f_trapped (Velasco)``.
+    result lies between 0 and ``f_trapped (Velasco)``. With ``main_well=True``
+    the upper bound is instead the trapped fraction held by the deepest well of
+    each field line, which is obtained by evaluating ``Gamma_delta`` with
+    ``gamma_th=-inf``.
     """
     (
         angle,
@@ -592,6 +630,7 @@ def _velasco_model(classifier, data, grid, kwargs):
         vander,
     ) = Bounce2D._defaults(-1, grid, **kwargs)
     gamma_th = kwargs.get("gamma_th", 0.2)
+    main_well = kwargs.get("main_well", False)
 
     def Gamma(data):
         bounce = Bounce2D(
@@ -610,7 +649,7 @@ def _velasco_model(classifier, data, grid, kwargs):
 
         def fun(pitch_inv):
             v_tau, gamma_c_star, poloidal_drift = _velasco_drifts(
-                bounce, data, pitch_inv, num_well, nufft_eps
+                bounce, data, pitch_inv, num_well, nufft_eps, main_well
             )
             unconfined = classifier(gamma_c_star, poloidal_drift, gamma_th)
             return (v_tau * unconfined).sum(-1).mean(-2)
@@ -802,9 +841,9 @@ def _Gamma_alpha(params, transforms, profiles, data, **kwargs):
     rather than an optimization objective.
 
     Particles are assumed to remain in the same well index while precessing in
-    α. This is exact in the single well per field line limit that reference [1]
-    assumes, and degrades where ripple wells appear and disappear across
-    neighboring field lines.
+    α. This is exact under ``main_well=True``, the single well per field line
+    limit that reference [1] assumes, and degrades with ``main_well=False``
+    where ripple wells appear and disappear across neighboring field lines.
 
     """
     data["Gamma_alpha"] = _velasco_model(

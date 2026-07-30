@@ -82,13 +82,24 @@ def test_alpha_loss_cone_no_superbanana():
 
 
 @pytest.mark.regression
-def test_velasco_models_normalization():
+@pytest.mark.parametrize("main_well", [False, True])
+def test_velasco_models_normalization(main_well):
     """Both models span exactly zero to f_trapped as gamma_th is swept.
 
     With ``gamma_th = -inf`` every trapped orbit is classified unconfined, so
     the phase space average must reproduce Velasco equation 24,
     f_trapped = <sqrt(1 - B / B_max)>, which is evaluated in closed form
     without bounce integrals. This pins the normalization of both models.
+
+    Keeping only the deepest well drops the trapped particles held by ripple
+    wells, so there the bound is the main well trapped fraction rather than the
+    full one, and only the upper bound of the comparison survives.
+
+    The bound approaches f_trapped from below as ``num_transit`` grows, because
+    a well that straddles either end of the finite field line is discarded. That
+    truncation decays like one over the field line length, so on W7-X the
+    residual is 25 % for a single transit and 7 % for four, which sets the
+    tolerance used here.
     """
     eq = get("W7-X")
     rho = np.linspace(0.3, 0.9, 3)
@@ -96,12 +107,13 @@ def test_velasco_models_normalization():
     kwargs = dict(
         angle=Bounce2D.angle(eq, X=32, Y=32, rho=rho, tol=1e-10),
         alpha=np.linspace(0, 2 * np.pi, 24, endpoint=False),
-        num_transit=1,
-        num_well=20,
+        num_transit=4,
+        num_well=80,
         num_pitch=48,
         num_quad=32,
         Y_B=grid.num_zeta * grid.NFP,
         nufft_eps=1e-10,
+        main_well=main_well,
     )
     names = ["Gamma_alpha", "Gamma_delta"]
 
@@ -112,16 +124,21 @@ def test_velasco_models_normalization():
     nothing = eq.compute(names, grid, gamma_th=np.inf, **kwargs)
     nominal = eq.compute(names, grid, gamma_th=GAMMA_TH, **kwargs)
 
+    # Classifying every trapped orbit as lost recovers the trapped fraction.
+    bound = grid.compress(everything["Gamma_delta"])
     for name in names:
         np.testing.assert_allclose(
-            grid.compress(everything[name]), f_trapped, rtol=5e-2,
-            err_msg=f"{name} does not reduce to f_trapped",
+            grid.compress(everything[name]), bound, rtol=1e-12,
+            err_msg=f"{name} disagrees with Gamma_delta when nothing is confined",
         )
         np.testing.assert_allclose(grid.compress(nothing[name]), 0, atol=1e-14)
+    assert (bound < f_trapped).all()
+    if not main_well:
+        np.testing.assert_allclose(bound, f_trapped, rtol=1e-1)
 
     g_a = grid.compress(nominal["Gamma_alpha"])
     g_d = grid.compress(nominal["Gamma_delta"])
     # Model II classifies a subset of what model I classifies.
     assert (g_a >= 0).all()
     assert (g_a <= g_d + 1e-12).all()
-    assert (g_d <= f_trapped * 1.05).all()
+    assert (g_d <= bound + 1e-12).all()
