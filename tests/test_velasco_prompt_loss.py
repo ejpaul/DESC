@@ -1,14 +1,18 @@
 """Tests for the Velasco et al. prompt loss models Gamma_delta and Gamma_alpha."""
 
+from functools import partial
+
 import numpy as np
 import pytest
 
 from desc.compute._fast_ion import (
     _alpha_loss_cone,
+    _gamma_c_Nemov_model,
     _superbanana_exists,
     _velasco_data,
     _velasco_model,
 )
+from desc.compute.utils import get_data_deps
 from desc.examples import get
 from desc.grid import LinearGrid
 from desc.integrals.bounce_integral import Bounce2D
@@ -176,21 +180,33 @@ def test_pitch_density_integrates_to_model():
         nufft_eps=1e-10,
         gamma_th=GAMMA_TH,
     )
-    data = eq.compute(_velasco_data, grid=grid, override_grid=False)
+    names = sorted(set(_velasco_data) | set(get_data_deps("Gamma_c", eq)))
+    data = eq.compute(names, grid=grid, override_grid=False)
     pitch_inv, weight = Bounce2D.get_pitch_inv_quad(
         grid.compress(data["min_tz |B|"]),
         grid.compress(data["max_tz |B|"]),
         kwargs["num_pitch"],
         simp=True,
     )
-    for name, classifier in (
-        ("Gamma_alpha", _alpha_loss_cone),
-        ("Gamma_delta", lambda g, d, th: _superbanana_exists(g, th)),
-    ):
-        density = _velasco_model(classifier, data, grid, kwargs, per_pitch=True)
+    # Gamma_c shares the pitch nodes but not the classifier or the quadrature
+    # along the well, so it exercises a second path through the same machinery.
+    # It is held to a looser tolerance because its longer reduction leaves the
+    # compiler more freedom to reassociate, so the two paths agree to rounding
+    # rather than bitwise. Anything the pitch quadrature could get wrong would
+    # show up far above this.
+    models = {
+        "Gamma_alpha": (partial(_velasco_model, _alpha_loss_cone), 1e-12),
+        "Gamma_delta": (
+            partial(_velasco_model, lambda g, d, th: _superbanana_exists(g, th)),
+            1e-12,
+        ),
+        "Gamma_c": (_gamma_c_Nemov_model, 1e-10),
+    }
+    for name, (model, rtol) in models.items():
+        density = model(data, grid, kwargs, per_pitch=True)
         np.testing.assert_allclose(
             np.sum(density * weight / pitch_inv**2, axis=-1),
             grid.compress(eq.compute(name, grid, **kwargs)[name]),
-            rtol=1e-12,
+            rtol=rtol,
             err_msg=name,
         )

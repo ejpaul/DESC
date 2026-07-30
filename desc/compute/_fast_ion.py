@@ -115,7 +115,24 @@ def _Gamma_c(params, transforms, profiles, data, **kwargs):
     have high energy with collisionless orbits, so it is assumed to be zero.
     """
     # noqa: unused dependency
-    grid = transforms["grid"]
+    data["Gamma_c"] = _gamma_c_Nemov_model(data, transforms["grid"], kwargs)
+    return data
+
+
+def _gamma_c_Nemov_model(data, grid, kwargs, per_pitch=False):
+    """Nemov's Gamma_c, optionally left resolved in the pitch coordinate.
+
+    Parameters
+    ----------
+    per_pitch : bool
+        If ``True``, stop before the quadrature over λ and return the density
+        dΓ_c/dλ with shape (num rho, num pitch) on the nodes given by
+        ``Bounce2D.get_pitch_inv_quad``, rather than the surface quantity Γ_c
+        expanded onto ``grid``. Contracting the density with the λ weights
+        ``pitch_inv weight / pitch_inv²`` recovers Γ_c exactly, since that
+        contraction is the only step this skips.
+
+    """
     (
         angle,
         Y_B,
@@ -172,11 +189,11 @@ def _Gamma_c(params, transforms, profiles, data, **kwargs):
             )
             return (v_tau * gamma_c**2).sum(-1).mean(-2)
 
+        density = batch_map(fun, data["pitch_inv"], pitch_batch_size)
+        if per_pitch:
+            return density
         return jnp.sum(
-            batch_map(fun, data["pitch_inv"], pitch_batch_size)
-            * data["pitch_inv weight"]
-            / data["pitch_inv"] ** 2,
-            axis=-1,
+            density * data["pitch_inv weight"] / data["pitch_inv"] ** 2, axis=-1
         )
 
     # It is assumed the grid is sufficiently dense to reconstruct |B|,
@@ -193,21 +210,18 @@ def _Gamma_c(params, transforms, profiles, data, **kwargs):
         * dot(cross(data["grad(psi)"], data["b"]), data["grad(phi)"])
         - (2 * data["|B|_r|v,p"] - data["|B|"] * data["B^phi_r|v,p"] / data["B^phi"]),
     }
-    data["Gamma_c"] = (
-        Bounce2D.batch(
-            Gamma_c,
-            fun_data,
-            data,
-            angle,
-            grid,
-            num_pitch,
-            surf_batch_size,
-            expand_out=True,
-        )
-        / data["V_psi"]
-        / (num_transit * 2**0.5)
+    out = Bounce2D.batch(
+        Gamma_c,
+        fun_data,
+        data,
+        angle,
+        grid,
+        num_pitch,
+        surf_batch_size,
+        expand_out=not per_pitch,
     )
-    return data
+    V_psi = grid.compress(data["V_psi"])[:, jnp.newaxis] if per_pitch else data["V_psi"]
+    return out / V_psi / (num_transit * 2**0.5)
 
 
 def _radial_drift(data, B, pitch):
