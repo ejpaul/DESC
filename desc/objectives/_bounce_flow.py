@@ -198,7 +198,7 @@ def drift_integrands(tb, s, alpha, zeta, Bc, h, th, floor=1e-4):
     vpar = jnp.sqrt(w) * jnp.sign(cth)
     dth_dt = vpar * fx["Bz"] / fx["B"] / (h * cth)
     # loss-cone birth moment: Jz B / (2 B_c^2 sqrt(1 - B/B_c)) dζ, dζ = h cos θ dθ
-    f = jnp.maximum(1.0 - fx["B"] / Bc, 1e-14)
+    f = jnp.maximum(1.0 - fx["B"] / Bc, 1e-8)
     dW = fx["Jz"] * fx["B"] / (2 * Bc**2) / jnp.sqrt(f) * h * cth
     return vd_s / dth_dt, vd_a / dth_dt, dW
 
@@ -212,7 +212,8 @@ def well0_tips_guess(tb, Bc, s, alpha, nscan=192):
     """Tips of the well containing the |B| minimum of the reference field period.
 
     Marches outward from the minimum to the first crossings of B_c on a dense ζ scan
-    over three periods; returns (zL, zR, valid).  Not differentiated (initial guess).
+    over three periods; returns (zL, zR, valid, dζ).  A class whose mirror points fall
+    more than one period from the minimum is not counted.  Not differentiated.
     """
     T = tb["T"]
     z = jnp.linspace(-T, 2 * T, 3 * nscan, endpoint=False)
@@ -236,7 +237,10 @@ def well0_tips_guess(tb, Bc, s, alpha, nscan=192):
 
     zR = cross(jR - 1, jR)
     zL = cross(jL + 1, jL)
-    valid = hasR & hasL & (B[im] < Bc)
+    # the class exists in the main well only if both mirror points lie within one
+    # field period of the minimum; wells spanning several periods (barely trapped,
+    # transitioning orbits) are outside the single-well model and carry no measure
+    valid = hasR & hasL & (B[im] < Bc) & (zR - z[im] <= T) & (z[im] - zL <= T)
     return zL, zR, valid, dz
 
 
@@ -522,7 +526,10 @@ class BounceFlowLoss(_Objective):
     eq : Equilibrium
         Equilibrium to optimize.
     bcrit : ndarray
-        Mirror fields B_c of the pitch classes [T].
+        Mirror fields B_c of the pitch classes [T].  Keep the classes away from the
+        trapped-passing boundary (B_c within ~10% of the maximum |B|): there the
+        bounce time and the loss-cone moment diverge and the single-well model does
+        not apply.
     bcrit_weights : ndarray, optional
         Quadrature weights in B_c (default: trapezoid on ``bcrit``).
     s_loss : float
