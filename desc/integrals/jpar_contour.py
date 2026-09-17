@@ -7,6 +7,23 @@ boundary (minimax J-margin).
 
 This module is a **diagnostic only** — not a differentiable objective.
 
+Well labelling
+--------------
+J∥ on the drift plane is only single-valued if every (ρ, α) refers to the *same*
+well family. Selecting the deepest well per (ρ, α) over several field periods
+(``well_select="deepest"``) stitches the map from wells whose field-line labels
+differ by k·ι(ρ)·2π/NFP; the seams act as spurious J barriers in the contour
+search. The default ``well_select="period"`` anchors the main well to the well
+containing the |B| minimum of one fixed field period (well-0 family), which is
+a consistent labelling: the resulting map is the well-0 map composed with a
+smooth α-shift, so its contour connectivity is that of the drift orbits.
+Margins measured on the stitched map are dominated by the seams (order
+ΔJ_char), so a ``dJ_crit`` calibrated against it does not transfer: on a
+consistently labelled map the margins of most seeds are a small fraction of
+ΔJ_char and ``dJ_crit`` should be chosen at the grid tolerance,
+of order 0.03–0.1 ΔJ_char.
+
+
 The v1 flood-fill / absolute-tolerance path is retained for regression tests and
 legacy diagnostics; new work should use ``minimax_margin`` / ``diagnose_margin``.
 
@@ -78,6 +95,91 @@ class JMainResult(NamedTuple):
     num_transit: int
     num_well: int
 
+    well_select: str = "period"
+    """Well labelling used: ``"period"`` (well containing the |B| minimum of the
+    reference field period) or ``"deepest"`` (deepest well per (ρ, α))."""
+
+    ref_period: int | None = None
+    """Index of the reference field period (``well_select="period"``)."""
+
+    zeta_min: np.ndarray | None = None
+    """Shape (n_rho, n_alpha). ζ of the |B| minimum in the reference period."""
+
+
+def fieldline_B_argmin(bounce, period, n_sub=8):
+    """ζ of the |B| minimum of one field period along each field line.
+
+    Parameters
+    ----------
+    bounce : Bounce2D
+        Bounce object built with ``spline=True``.
+    period : int
+        Field-period index in ``[0, num_transit * NFP)``.
+    n_sub : int
+        Sub-samples per spline interval used to locate the minimum.
+
+    Returns
+    -------
+    zeta_min, B_min : ndarray
+        Shape (n_rho, n_alpha). Location and value of the minimum.
+    """
+    c = np.asarray(bounce._c["B(z)"])  # (n_rho, n_alpha, n_knot - 1, 4), power basis
+    knots = np.asarray(bounce._c["knots"])
+    if c.ndim != 4:
+        raise ValueError("fieldline_B_argmin requires Bounce2D(spline=True)")
+    T = 2 * np.pi / bounce._NFP
+    lo, hi = period * T, (period + 1) * T
+    k = np.flatnonzero((knots[:-1] >= lo - 1e-12) & (knots[:-1] < hi - 1e-12))
+    if k.size == 0:
+        raise ValueError(f"period {period} lies outside the field-line domain")
+    x = np.linspace(0.0, 1.0, n_sub, endpoint=False)
+    dz = (knots[k + 1] - knots[k])[:, None] * x[None, :]  # (n_int, n_sub)
+    ck = c[:, :, k, :]  # (n_rho, n_alpha, n_int, 4)
+    B = ((ck[..., 0:1] * dz + ck[..., 1:2]) * dz + ck[..., 2:3]) * dz + ck[..., 3:4]
+    B = B.reshape(B.shape[0], B.shape[1], -1)
+    z = (knots[k][:, None] + dz).reshape(-1)
+    i = np.argmin(B, axis=-1)
+    return z[i], np.take_along_axis(B, i[..., None], axis=-1)[..., 0]
+
+
+def select_period_well(J_all, B_bot_all, z1, z2, zeta_min):
+    """Pick the well that contains ``zeta_min`` (the reference-period minimum).
+
+    Parameters
+    ----------
+    J_all, B_bot_all, z1, z2 : array_like
+        Shape (..., n_well), as in ``select_main_well``.
+    zeta_min : array_like
+        Broadcastable to the leading axes of ``J_all``: ζ of the |B| minimum of
+        the reference field period on each field line.
+
+    Returns
+    -------
+    Same as ``select_main_well``. The mask is False where no well contains the
+    reference minimum (the class does not exist in the main well of that line).
+    """
+    J_all = np.asarray(J_all)
+    B_bot_all = np.asarray(B_bot_all)
+    z1 = np.asarray(z1)
+    z2 = np.asarray(z2)
+    zm = np.asarray(zeta_min, dtype=float)[..., None]
+    valid = z1 < z2
+    contains = valid & (z1 <= zm) & (zm <= z2)
+    has = np.any(contains, axis=-1)
+    main_idx = np.argmax(contains, axis=-1)  # first containing well; 0 if none
+    gather = np.expand_dims(main_idx, axis=-1)
+    J_main = np.take_along_axis(J_all, gather, axis=-1)[..., 0]
+    B_bot = np.take_along_axis(B_bot_all, gather, axis=-1)[..., 0]
+    z1_m = np.take_along_axis(z1, gather, axis=-1)[..., 0]
+    z2_m = np.take_along_axis(z2, gather, axis=-1)[..., 0]
+    mask = has & np.isfinite(J_main) & (J_main > 0)
+    J_out = np.where(mask, J_main, np.nan)
+    B_out = np.where(mask, B_bot, np.nan)
+    delta_zeta = np.where(mask, z2_m - z1_m, np.nan)
+    zeta1 = np.where(mask, z1_m, np.nan)
+    zeta2 = np.where(mask, z2_m, np.nan)
+    return J_out, mask, main_idx, B_out, delta_zeta, zeta1, zeta2
+
 
 def select_main_well(J_all, B_bot_all, z1, z2):
     """Pick the well whose interior contains the global |B| minimum.
@@ -137,6 +239,8 @@ def build_j_main(
     nufft_eps=1e-6,
     spline=True,
     check_points=False,
+    well_select="period",
+    ref_period=None,
 ):
     """Build main-well J∥(ρ, α, λ) with Bounce2D.
 
@@ -165,11 +269,26 @@ def build_j_main(
     check_points : bool
         If True, run ``Bounce2D.check_points`` (no plots) on the first pitch
         batch as a sanity check.
+    well_select : {"period", "deepest"}
+        ``"period"`` (default): the main well is the well containing the |B|
+        minimum of the field period ``ref_period`` on each line (well-0 family;
+        consistent labelling across the drift plane, see module docstring).
+        Requires ``spline=True``. ``"deepest"``: the deepest well per (ρ, α)
+        over all transits (legacy; stitches wells and creates spurious barriers).
+    ref_period : int, optional
+        Field-period index for ``well_select="period"``. Default: the middle
+        period of the domain, ``(num_transit * NFP) // 2``.
 
     Returns
     -------
     JMainResult
     """
+    if well_select not in ("period", "deepest"):
+        raise ValueError(
+            f"well_select must be 'period' or 'deepest', got {well_select!r}"
+        )
+    if well_select == "period" and not spline:
+        raise ValueError("well_select='period' requires spline=True")
     rho = np.asarray(
         rho if rho is not None else np.linspace(0.1, 1.0, 24), dtype=float
     )
@@ -199,6 +318,12 @@ def build_j_main(
         bounce_kwargs.pop("Y_B")
 
     bounce = Bounce2D(grid, data, angle, **bounce_kwargs)
+
+    zeta_min = None
+    if well_select == "period":
+        if ref_period is None:
+            ref_period = (num_transit * eq.NFP) // 2
+        zeta_min, _ = fieldline_B_argmin(bounce, ref_period)
 
     min_B = np.asarray(grid.compress(data["min_tz |B|"]))
     max_B = np.asarray(grid.compress(data["max_tz |B|"]))
@@ -257,9 +382,14 @@ def build_j_main(
         if resolved_num_well is None:
             resolved_num_well = int(np.asarray(z1).shape[-1])
 
-        J_m, msk, midx, Bb, dz, z1m, z2m = select_main_well(
-            J_all, B_bot_all, z1, z2
-        )
+        if well_select == "period":
+            J_m, msk, midx, Bb, dz, z1m, z2m = select_period_well(
+                J_all, B_bot_all, z1, z2, zeta_min[:, :, None]
+            )
+        else:
+            J_m, msk, midx, Bb, dz, z1m, z2m = select_main_well(
+                J_all, B_bot_all, z1, z2
+            )
         J_chunks.append(J_m)
         mask_chunks.append(msk)
         idx_chunks.append(midx)
@@ -282,6 +412,9 @@ def build_j_main(
         zeta2=np.concatenate(z2_chunks, axis=-1),
         num_transit=num_transit,
         num_well=int(resolved_num_well),
+        well_select=well_select,
+        ref_period=ref_period,
+        zeta_min=zeta_min,
     )
 
 

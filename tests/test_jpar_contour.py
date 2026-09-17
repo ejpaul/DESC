@@ -266,3 +266,72 @@ class TestDiagnoseAggregate:
         mask = np.ones_like(J, dtype=bool)
         tol = default_tol(J, mask, 0, 0)
         assert tol > 0
+
+
+class TestPeriodWell:
+    """Period-anchored (well-0 family) main-well selection."""
+
+    def test_select_period_well_picks_containing_well(self):
+        from desc.integrals.jpar_contour import select_period_well
+
+        # two lines, two wells each: [0,1] and [2,3]; the deepest well is
+        # well 1 on line 0 but the reference minimum sits in well 0
+        z1 = np.array([[0.0, 2.0], [0.0, 2.0]])
+        z2 = np.array([[1.0, 3.0], [1.0, 3.0]])
+        J = np.array([[1.0, 5.0], [1.0, 5.0]])
+        Bb = np.array([[1.2, 1.0], [1.0, 1.2]])
+        zmin = np.array([0.5, 2.5])
+        J_m, mask, idx, Bb_m, dz, zm1, zm2 = select_period_well(J, Bb, z1, z2, zmin)
+        np.testing.assert_array_equal(idx, [0, 1])
+        np.testing.assert_array_equal(mask, [True, True])
+        np.testing.assert_allclose(J_m, [1.0, 5.0])
+        np.testing.assert_allclose(dz, [1.0, 1.0])
+
+    def test_select_period_well_no_containing_well(self):
+        from desc.integrals.jpar_contour import select_period_well
+
+        z1 = np.array([[0.0, 2.0]])
+        z2 = np.array([[1.0, 3.0]])
+        J = np.array([[1.0, 5.0]])
+        Bb = np.array([[1.0, 1.0]])
+        J_m, mask, idx, Bb_m, dz, zm1, zm2 = select_period_well(
+            J, Bb, z1, z2, np.array([1.5])
+        )
+        assert not mask[0]
+        assert np.isnan(J_m[0]) and np.isnan(dz[0])
+
+    def test_select_period_well_ignores_padded_wells(self):
+        from desc.integrals.jpar_contour import select_period_well
+
+        # a padded well (z1 = z2 = 0) must not be selected even though it
+        # "contains" zeta = 0
+        z1 = np.array([[0.0, 2.0]])
+        z2 = np.array([[0.0, 3.0]])
+        J = np.array([[0.0, 4.0]])
+        Bb = np.array([[np.nan, 1.0]])
+        J_m, mask, idx, *_ = select_period_well(J, Bb, z1, z2, np.array([0.0]))
+        assert not mask[0]
+
+    def test_fieldline_B_argmin_synthetic_spline(self):
+        from desc.integrals.jpar_contour import fieldline_B_argmin
+
+        class FakeBounce:
+            _NFP = 4
+
+        # domain [0, 2 transits * 2pi], 8 knots per transit; B(z) = 2 - cos(NFP z)
+        # tabulated as a piecewise linear polynomial in the local power basis
+        knots = np.linspace(0, 4 * np.pi, 2 * 8 * 4, endpoint=False)
+        knots = np.append(knots, 4 * np.pi)
+        B0 = 2 - np.cos(4 * knots[:-1])
+        B1 = 2 - np.cos(4 * knots[1:])
+        slope = (B1 - B0) / np.diff(knots)
+        c = np.zeros((1, 1, knots.size - 1, 4))
+        c[..., 2] = slope
+        c[..., 3] = B0
+        fb = FakeBounce()
+        fb._c = {"B(z)": c, "knots": knots}
+        zmin, Bmin = fieldline_B_argmin(fb, period=4, n_sub=4)
+        # the minimum of 2 - cos(4z) in period 4, z in [2pi, 2pi + pi/2), is at
+        # z = 2pi where cos = 1
+        np.testing.assert_allclose(zmin[0, 0], 2 * np.pi, atol=knots[1] - knots[0])
+        assert Bmin[0, 0] <= 1.0 + 0.3

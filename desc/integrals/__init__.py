@@ -13,6 +13,7 @@ from .jpar_contour import (
     diagnose,
     diagnose_margin,
     dilate_mask,
+    fieldline_B_argmin,
     firm3d_seed_pitch_weights,
     firm3d_vpar_pitch_weights,
     fusion_birth_radial_weight,
@@ -28,6 +29,7 @@ from .jpar_contour import (
     persistence_check,
     reaches_wall_flood_fill,
     select_main_well,
+    select_period_well,
     weighted_fraction,
 )
 from .singularities import (
