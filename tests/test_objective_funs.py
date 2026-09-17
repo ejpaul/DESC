@@ -45,6 +45,7 @@ from desc.objectives import (
     AspectRatio,
     BallooningStability,
     BootstrapRedlConsistency,
+    BounceFlowLoss,
     BoundaryError,
     BScaleLength,
     CoilArclengthVariance,
@@ -3301,6 +3302,7 @@ class TestComputeScalarResolution:
     specials = [
         # these require special logic
         BootstrapRedlConsistency,
+        BounceFlowLoss,
         BoundaryError,
         CoilArclengthVariance,
         CoilCurrentLength,
@@ -3820,6 +3822,7 @@ class TestObjectiveNaNGrad:
         # these require special logic
         BallooningStability,
         BootstrapRedlConsistency,
+        BounceFlowLoss,
         BoundaryError,
         CoilArclengthVariance,
         CoilCurrentLength,

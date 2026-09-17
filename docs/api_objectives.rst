@@ -42,6 +42,7 @@ Fast ion confinement
     :recursive:
     :template: class.rst
 
+    desc.objectives.BounceFlowLoss
     desc.objectives.GammaC
 
 

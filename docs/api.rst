@@ -198,6 +198,7 @@ Objective Functions
     desc.objectives.AspectRatio
     desc.objectives.BallooningStability
     desc.objectives.BootstrapRedlConsistency
+    desc.objectives.BounceFlowLoss
     desc.objectives.BoundaryError
     desc.objectives.BScaleLength
     desc.objectives.CoilArclengthVariance

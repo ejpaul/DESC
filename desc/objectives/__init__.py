@@ -1,6 +1,7 @@
 """Classes defining objectives for equilibrium and optimization."""
 
 from ._bootstrap import BootstrapRedlConsistency
+from ._bounce_flow import BounceFlowLoss
 from ._coils import (
     CoilArclengthVariance,
     CoilCurrentLength,
