@@ -341,7 +341,11 @@ def flow_map(D_grid, s_ax, a_ax, P, nsub=8, k=1, s_loss=None):
         x = jnp.stack([jnp.clip(x[:, 0], s_ax[0], s_hi), x[:, 1] % (2 * jnp.pi)], -1)
         return (x, jnp.maximum(smax, x[:, 0])), None
 
-    (x, smax), _ = jax.lax.scan(step, (P, P[:, 0]), None, length=int(nsub * k))
+    # rematerialise each RK4 step in the backward pass: the scan then stores only the
+    # state per step instead of the interpolant's stencils (memory ∝ cells, not steps)
+    (x, smax), _ = jax.lax.scan(
+        jax.checkpoint(step), (P, P[:, 0]), None, length=int(nsub * k)
+    )
     if s_loss is None:
         return x
     # a path that reached the wall during the k bounces is absorbed: near the wall the
@@ -768,7 +772,8 @@ class BounceFlowLoss(_Objective):
             mu = W.reshape(ns, na) * constants["S_sec"][:, None] * constants["cell"]
             return self._op(MP, mu), jnp.sum(mu)
 
-        num, tot = jax.lax.map(one_class, constants["bcrit"])
+        # one class at a time in the backward pass as well (residuals of a single class)
+        num, tot = jax.lax.map(jax.checkpoint(one_class), constants["bcrit"])
         if self._per_class:
             return num / tot
         return eq.NFP * constants["bcrit_weights"] * num / denom
