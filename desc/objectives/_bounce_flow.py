@@ -244,13 +244,19 @@ def well0_tips_guess(tb, Bc, s, alpha, nscan=192):
     return zL, zR, valid, dz
 
 
-def _safe(d):
-    return jnp.where(jnp.abs(d) > 1e-6, d, jnp.where(d >= 0, 1e-6, -1e-6))
+def _safe(d, floor=1e-6):
+    return jnp.where(jnp.abs(d) > floor, d, jnp.where(d >= 0, floor, -floor))
 
 
-def displacement_fn(nq=32, newton=8, nscan=192):
+def displacement_fn(nq=32, newton=8, nscan=192, tip_slope_min=0.02):
     """disp(tb, Bc, sa) -> (D (2,), W): one-bounce displacement of the flow and the
-    loss-cone moment of the class at the section point sa = (s, α)."""
+    loss-cone moment of the class at the section point sa = (s, α).
+
+    ``tip_slope_min`` is the smallest |dB/dζ| (relative to B_c, per radian) accepted at
+    a mirror point: a mirror point on a nearly flat stretch of B sits next to a local
+    maximum (barely trapped in that well), its position responds to the field as
+    1/B′, and the single-well model does not hold there; such cells carry no measure
+    and no gradient."""
     xg, wg = leggauss(nq)
     thj = jnp.asarray(xg * np.pi / 2)
     wj = jnp.asarray(wg * np.pi / 2)
@@ -271,17 +277,22 @@ def displacement_fn(nq=32, newton=8, nscan=192):
 
             z, _ = jax.lax.scan(body, z0, None, length=newton)
             z = jax.lax.stop_gradient(z)
-            # value = converged root; derivative = implicit-function derivative
-            return z - (Bof(z) - Bc) / _safe(jax.grad(Bof)(z))
+            # value = converged root; derivative = implicit-function derivative, with
+            # the slope floored so that a flat mirror point cannot amplify the gradient
+            slope = jax.grad(Bof)(z)
+            return z - (Bof(z) - Bc) / _safe(slope, tip_slope_min * Bc), slope
 
-        zL, zR = tip(zL0), tip(zR0)
+        (zL, dBL), (zR, dBR) = tip(zL0), tip(zR0)
         c, h = 0.5 * (zL + zR), 0.5 * (zR - zL)
         zLs, zRs, hs = (jax.lax.stop_gradient(v) for v in (zL, zR, h))
+        dBLs, dBRs = jax.lax.stop_gradient(dBL), jax.lax.stop_gradient(dBR)
         ok = (
             valid
             & (hs > 1e-4)
             & (jnp.abs(Bof(zLs) - Bc) < 1e-3)
             & (jnp.abs(Bof(zRs) - Bc) < 1e-3)
+            & (jnp.abs(dBLs) > tip_slope_min * Bc)
+            & (jnp.abs(dBRs) > tip_slope_min * Bc)
         )
         # keep the unselected branch finite so the VJP of jnp.where stays NaN-free
         c = jnp.where(ok, c, 0.0)
@@ -553,6 +564,9 @@ class BounceFlowLoss(_Objective):
     num_quad, nsub, newton, nscan : int
         Bounce quadrature nodes, RK4 substeps per bounce of the flow map, Newton steps
         for the mirror points, ζ samples per period of the well scan.
+    tip_slope_min : float
+        Smallest |dB/dζ| / B_c (per radian) accepted at a mirror point; cells whose
+        mirror points sit on flatter B carry no measure (see ``displacement_fn``).
     birth : {"reactivity", "uniform"}
         Radial birth profile.
     Ekin, mass, charge : float
@@ -594,6 +608,7 @@ class BounceFlowLoss(_Objective):
         nsub=4,
         newton=8,
         nscan=192,
+        tip_slope_min=0.02,
         birth="reactivity",
         Ekin=_E_ALPHA,
         mass=_ALPHA_M,
@@ -637,6 +652,7 @@ class BounceFlowLoss(_Objective):
             "nsub": int(nsub),
             "newton": int(newton),
             "nscan": int(nscan),
+            "tip_slope_min": float(tip_slope_min),
             "birth": birth,
             "Ekin": float(Ekin),
             "mass": float(mass),
@@ -707,7 +723,10 @@ class BounceFlowLoss(_Objective):
         }
         self._v2 = 2 * hp["Ekin"] / hp["mass"]
         self._disp = displacement_fn(
-            nq=hp["num_quad"], newton=hp["newton"], nscan=hp["nscan"]
+            nq=hp["num_quad"],
+            newton=hp["newton"],
+            nscan=hp["nscan"],
+            tip_slope_min=hp["tip_slope_min"],
         )
         self._op = make_resolvent_op(s_ax, a_ax, hp["s_loss"], hp["nu"] * hp["k"])
         self._dim_f = len(hp["bcrit"])
