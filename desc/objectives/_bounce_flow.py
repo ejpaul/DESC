@@ -244,6 +244,41 @@ def well0_tips_guess(tb, Bc, s, alpha, nscan=192):
     return zL, zR, valid, dz
 
 
+def class_measure_line(tb, Bc, s, alpha, nscan=192):
+    """∫₀ᵀ dζ Jz B / (2 B_c² √(1 − B/B_c)) over B < B_c on the line (s, α): the loss-cone
+    birth moment of the class on the line over one field period, every well included
+    (the α-average times NFP is the total measure of the class).  B is piecewise linear
+    between scan points and the √ singularity at the mirror points is integrated
+    exactly, so the sum over the section grid is a smooth function of the geometry."""
+    T = tb["T"]
+    z = jnp.linspace(0.0, T, nscan + 1)
+    f = jax.vmap(lambda zz: sample(tb, s, alpha, zz, keys=["B", "Jz"]))(z)
+    B, Jz = f["B"], f["Jz"]
+    B0, B1 = B[:-1], B[1:]
+    r0 = jnp.sqrt(jnp.maximum(1.0 - B0 / Bc, 0.0))
+    r1 = jnp.sqrt(jnp.maximum(1.0 - B1 / Bc, 0.0))
+    dz = z[1] - z[0]
+    dB = B1 - B0
+    flat = jnp.abs(dB) < 1e-9 * Bc
+    # ∫ dζ / √(1 − B/B_c) with B linear on the segment: (dζ/dB) 2 B_c [r(B₀) − r(B₁)] with
+    # r(B) = √(1 − min(B, B_c)/B_c), exact through a mirror point inside the segment and
+    # zero where B ≥ B_c throughout; a segment of constant B contributes dζ / r
+    I_lin = dz / jnp.where(flat, 1.0, dB) * 2.0 * Bc * (r0 - r1)
+    I_flat = dz * jnp.where(r0 > 0, 1.0 / jnp.maximum(r0, 1e-12), 0.0)
+    I = jnp.where(flat, I_flat, I_lin)
+    pref = 0.5 * (Jz[:-1] + Jz[1:]) * 0.5 * (jnp.minimum(B0, Bc) + jnp.minimum(B1, Bc)) / (2.0 * Bc**2)
+    return jnp.sum(pref * I)
+
+
+def class_measure_grid(tb, Bc, P, nscan=192, chunk=4000):
+    """Total loss-cone moment of the class at the section points P (n, 2), chunked."""
+    n = len(P)
+    pad = (-n) % chunk
+    Pp = jnp.vstack([P, jnp.tile(P[:1], (pad, 1))]).reshape(-1, chunk, 2)
+    f = jax.checkpoint(jax.vmap(lambda sa: class_measure_line(tb, Bc, sa[0], sa[1], nscan)))
+    return jax.lax.map(f, Pp).reshape(-1)[:n]
+
+
 def _safe(d, floor=1e-6):
     return jnp.where(jnp.abs(d) > floor, d, jnp.where(d >= 0, floor, -floor))
 
@@ -321,7 +356,19 @@ def displacement_grid(tb, Bc, P, disp, chunk=4000):
 def flow_map(D_grid, s_ax, a_ax, P, nsub=8, k=1, s_loss=None):
     """Time-k map of dx/dτ = D(x) (k bounces) with a bicubic interpolant of D (periodic
     in α), integrated by RK4 with ``nsub`` substeps per bounce.  With ``s_loss`` given,
-    paths that touch the wall within the k bounces are reported at their maximum s."""
+    paths that touch the wall within the k bounces are reported at their maximum s.
+
+    With ``k = nsub = 1`` the map is the one-bounce landing point x + D(x) itself: no
+    interpolant and no composition, so the tangent map is 1 + ∇D and the sensitivity of
+    the operator to the geometry cannot grow with the horizon (the resolvent composes
+    bounces at the level of the measure, where the coarse-graining smooths)."""
+    ds = s_ax[1] - s_ax[0]
+    s_hi = (
+        s_ax[-1] + 3 * ds if s_loss is None else jnp.maximum(s_loss, s_ax[-1]) + 3 * ds
+    )
+    if int(k) == 1 and int(nsub) == 1:
+        x = P + D_grid.reshape(-1, 2)
+        return jnp.stack([jnp.clip(x[:, 0], s_ax[0], s_hi), x[:, 1] % (2 * jnp.pi)], -1)
 
     def Dfun(x):
         s = jnp.clip(x[:, 0], s_ax[0], s_ax[-1])
@@ -335,10 +382,6 @@ def flow_map(D_grid, s_ax, a_ax, P, nsub=8, k=1, s_loss=None):
         return jnp.stack([ds, da], -1)
 
     h = 1.0 / nsub
-    ds = s_ax[1] - s_ax[0]
-    s_hi = (
-        s_ax[-1] + 3 * ds if s_loss is None else jnp.maximum(s_loss, s_ax[-1]) + 3 * ds
-    )
 
     def step(carry, _):
         x, smax = carry
@@ -553,8 +596,18 @@ class BounceFlowLoss(_Objective):
         Exponential-clock rate per bounce; 1/nu is the mean horizon in bounces.
     k : int
         Bounces composed per operator step (the flow is integrated over k bounces
-        before it is discretised).  Larger k reduces the grid coarse-graining of the
-        operator at no cost in map evaluations; the clock rate per step is k nu.
+        before it is discretised); the clock rate per step is k nu.  With the default
+        k = nsub = 1 the operator step is the one-bounce landing point x + D(x): the
+        sensitivity of the operator to the geometry is then 1 + ∇D and cannot grow
+        with the horizon, which keeps the objective smooth away from well-confined
+        configurations (a composed flow multiplies the stretching of the map: on a
+        stochastic configuration the gradient grows ~100-fold per composed bounce).
+        The price is the coarse-graining diffusion of the operator, variance h²/4 per
+        bounce for a radial cell h, i.e. a radial smoothing width h √(N/4) after N
+        bounces (0.06 in s for ns = 160 and a 3 ms clock; a larger k or a finer ns
+        reduces it).  On the SQuID family the k = 1 operator on a 160 × 240 section
+        grid keeps the correlation with firm3d (r = 0.97 for the 3 ms clock, level
+        0.9) that the k = 10 operator has.
     rho : ndarray, optional
         Flux surfaces of the geometry tables (default 48 surfaces, s ∈ [0.02, 0.98]).
     M_tab, N_tab : int
@@ -562,8 +615,9 @@ class BounceFlowLoss(_Objective):
     ns, na : int
         Section grid in s and α.
     num_quad, nsub, newton, nscan : int
-        Bounce quadrature nodes, RK4 substeps per bounce of the flow map, Newton steps
-        for the mirror points, ζ samples per period of the well scan.
+        Bounce quadrature nodes, RK4 substeps per bounce of the flow map (only used
+        when the flow is integrated, i.e. unless k = nsub = 1), Newton steps for the
+        mirror points, ζ samples per period of the well scan.
     tip_slope_min : float
         Smallest |dB/dζ| / B_c (per radian) accepted at a mirror point; cells whose
         mirror points sit on flatter B carry no measure (see ``displacement_fn``).
@@ -601,14 +655,14 @@ class BounceFlowLoss(_Objective):
         bcrit_weights=None,
         s_loss=0.98,
         nu=1.0 / 350.0,
-        k=10,
+        k=1,
         rho=None,
         M_tab=64,
         N_tab=32,
         ns=200,
         na=300,
         num_quad=32,
-        nsub=4,
+        nsub=1,
         newton=8,
         nscan=192,
         tip_slope_min=0.05,
@@ -799,6 +853,40 @@ class BounceFlowLoss(_Objective):
         if self._per_class:
             return num / tot
         return eq.NFP * constants["bcrit_weights"] * num / denom
+
+    def class_measure(self, params):
+        """Tracked and total birth measure of each class (diagnostic).
+
+        Returns (tracked, total): the measure carried by the section cells whose
+        well-0 mirror points pass the single-well tests (what the operator moves) and
+        the total loss-cone moment of the class over the volume (all wells), both in
+        the units of the objective's numerator.  1 - tracked/total is the fraction of
+        the class that the objective neither confines nor loses.
+        """
+        constants = self._constants
+        eq = self.things[0]
+        hp = self._hyper
+        data = compute_fun(
+            eq, self._keys, params, constants["transforms"], constants["profiles"]
+        )
+        tb = tables_from_data(
+            data,
+            constants["grid"],
+            constants["rho"],
+            eq.NFP,
+            self._v2,
+            2 * hp["M_tab"] + 1,
+        )
+        P = constants["P"]
+        ns, na = hp["ns"], hp["na"]
+        wgt = constants["S_sec"][:, None] * constants["cell"]
+
+        def one_class(Bc):
+            _, W = displacement_grid(tb, Bc, P, self._disp)
+            Wt = class_measure_grid(tb, Bc, P, hp["nscan"])
+            return jnp.sum(W.reshape(ns, na) * wgt), jnp.sum(Wt.reshape(ns, na) * wgt)
+
+        return jax.lax.map(one_class, constants["bcrit"])
 
     def class_loss(self, params):
         """Loss fraction of each class, ∫ μ_c u_c / ∫ μ_c (diagnostic)."""
