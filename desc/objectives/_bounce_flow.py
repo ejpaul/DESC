@@ -248,7 +248,7 @@ def _safe(d, floor=1e-6):
     return jnp.where(jnp.abs(d) > floor, d, jnp.where(d >= 0, floor, -floor))
 
 
-def displacement_fn(nq=32, newton=8, nscan=192, tip_slope_min=0.02):
+def displacement_fn(nq=32, newton=8, nscan=192, tip_slope_min=0.05):
     """disp(tb, Bc, sa) -> (D (2,), W): one-bounce displacement of the flow and the
     loss-cone moment of the class at the section point sa = (s, α).
 
@@ -567,6 +567,9 @@ class BounceFlowLoss(_Objective):
     tip_slope_min : float
         Smallest |dB/dζ| / B_c (per radian) accepted at a mirror point; cells whose
         mirror points sit on flatter B carry no measure (see ``displacement_fn``).
+        The default 0.05 keeps the boundary gradient bounded on truncated (low-mode)
+        equilibria with nearly flat mirror points; 0.02 leaves it singular there
+        while the value is unchanged to 1e-3.
     birth : {"reactivity", "uniform"}
         Radial birth profile.
     Ekin, mass, charge : float
@@ -608,7 +611,7 @@ class BounceFlowLoss(_Objective):
         nsub=4,
         newton=8,
         nscan=192,
-        tip_slope_min=0.02,
+        tip_slope_min=0.05,
         birth="reactivity",
         Ekin=_E_ALPHA,
         mass=_ALPHA_M,
